@@ -17,12 +17,8 @@
 A source to be used in testing.
 """
 
-import pytz
-
-from itertools import cycle
-from six.moves import filter, zip
-from datetime import datetime, timedelta
-import numpy as np
+from datetime import timedelta
+import itertools
 
 from six.moves import range
 
@@ -30,8 +26,6 @@ from zipline.protocol import (
     Event,
     DATASOURCE_TYPE
 )
-from zipline.gens.utils import hash_args
-from zipline.finance.trading import with_environment
 
 
 def create_trade(sid, price, amount, datetime, source_id="test_factory"):
@@ -52,12 +46,11 @@ def create_trade(sid, price, amount, datetime, source_id="test_factory"):
     return trade
 
 
-@with_environment()
-def date_gen(start=datetime(2006, 6, 6, 12, tzinfo=pytz.utc),
+def date_gen(start,
+             end,
+             trading_calendar,
              delta=timedelta(minutes=1),
-             count=100,
-             repeats=None,
-             env=None):
+             repeats=None):
     """
     Utility to generate a stream of dates.
     """
@@ -76,19 +69,23 @@ def date_gen(start=datetime(2006, 6, 6, 12, tzinfo=pytz.utc),
         """
         cur = cur + delta
 
-        if not (env.is_trading_day
-                if daily_delta
-                else env.is_market_hours)(cur):
-            if daily_delta:
-                return env.next_trading_day(cur)
-            else:
-                return env.next_open_and_close(cur)[0]
-        else:
+        currently_executing = \
+            (daily_delta and (cur in trading_calendar.all_sessions)) or \
+            (trading_calendar.is_open_on_minute(cur))
+
+        if currently_executing:
             return cur
+        else:
+            if daily_delta:
+                return trading_calendar.minute_to_session_label(cur)
+            else:
+                return trading_calendar.open_and_close_for_session(
+                    trading_calendar.minute_to_session_label(cur)
+                )[0]
 
     # yield count trade events, all on trading days, and
     # during trading hours.
-    for i in range(count):
+    while cur < end:
         if repeats:
             for j in range(repeats):
                 yield cur
@@ -96,22 +93,6 @@ def date_gen(start=datetime(2006, 6, 6, 12, tzinfo=pytz.utc),
             yield cur
 
         cur = advance_current(cur)
-
-
-def mock_prices(count):
-    """
-    Utility to generate a stream of mock prices. By default
-    cycles through values from 0.0 to 10.0, n times.
-    """
-    return (float(i % 10) + 1.0 for i in range(count))
-
-
-def mock_volumes(count):
-    """
-    Utility to generate a set of volumes. By default cycles
-    through values from 100 to 1000, incrementing by 50.
-    """
-    return ((i * 50) % 900 + 100 for i in range(count))
 
 
 class SpecificEquityTrades(object):
@@ -128,46 +109,23 @@ class SpecificEquityTrades(object):
     delta  : timedelta between internal events
     filter : filter to remove the sids
     """
+    def __init__(self,
+                 trading_calendar,
+                 asset_finder,
+                 sids,
+                 start,
+                 end,
+                 delta,
+                 count=500):
 
-    def __init__(self, *args, **kwargs):
-        # We shouldn't get any positional arguments.
-        assert len(args) == 0
+        self.trading_calendar = trading_calendar
 
-        # Default to None for event_list and filter.
-        self.event_list = kwargs.get('event_list')
-        self.filter = kwargs.get('filter')
-
-        if self.event_list is not None:
-            # If event_list is provided, extract parameters from there
-            # This isn't really clean and ultimately I think this
-            # class should serve a single purpose (either take an
-            # event_list or autocreate events).
-            self.count = kwargs.get('count', len(self.event_list))
-            self.sids = kwargs.get(
-                'sids',
-                np.unique([event.sid for event in self.event_list]).tolist())
-            self.start = kwargs.get('start', self.event_list[0].dt)
-            self.end = kwargs.get('start', self.event_list[-1].dt)
-            self.delta = kwargs.get(
-                'delta',
-                self.event_list[1].dt - self.event_list[0].dt)
-            self.concurrent = kwargs.get('concurrent', False)
-
-        else:
-            # Unpack config dictionary with default values.
-            self.count = kwargs.get('count', 500)
-            self.sids = kwargs.get('sids', [1, 2])
-            self.start = kwargs.get(
-                'start',
-                datetime(2008, 6, 6, 15, tzinfo=pytz.utc))
-            self.delta = kwargs.get(
-                'delta',
-                timedelta(minutes=1))
-            self.concurrent = kwargs.get('concurrent', False)
-
-        # Hash_value for downstream sorting.
-        self.arg_string = hash_args(*args, **kwargs)
-
+        # Unpack config dictionary with default values.
+        self.count = count
+        self.start = start
+        self.end = end
+        self.delta = delta
+        self.sids = sids
         self.generator = self.create_fresh_generator()
 
     def __iter__(self):
@@ -182,59 +140,25 @@ class SpecificEquityTrades(object):
     def rewind(self):
         self.generator = self.create_fresh_generator()
 
-    def get_hash(self):
-        return self.__class__.__name__ + "-" + self.arg_string
-
     def update_source_id(self, gen):
         for event in gen:
             event.source_id = self.get_hash()
             yield event
 
     def create_fresh_generator(self):
-
-        if self.event_list:
-            event_gen = (event for event in self.event_list)
-            unfiltered = self.update_source_id(event_gen)
-
-        # Set up iterators for each expected field.
-        else:
-            if self.concurrent:
-                # in this context the count is the number of
-                # trades per sid, not the total.
-                dates = date_gen(
-                    count=self.count,
-                    start=self.start,
-                    delta=self.delta,
-                    repeats=len(self.sids),
-                )
-            else:
-                dates = date_gen(
-                    count=self.count,
-                    start=self.start,
-                    delta=self.delta
-                )
-
-            prices = mock_prices(self.count)
-            volumes = mock_volumes(self.count)
-
-            sids = cycle(self.sids)
-
-            # Combine the iterators into a single iterator of arguments
-            arg_gen = zip(sids, prices, volumes, dates)
-
-            # Convert argument packages into events.
-            unfiltered = (create_trade(*args, source_id=self.get_hash())
-                          for args in arg_gen)
-
-        # If we specified a sid filter, filter out elements that don't
-        # match the filter.
-        if self.filter:
-            filtered = filter(
-                lambda event: event.sid in self.filter, unfiltered)
-
-        # Otherwise just use all events.
-        else:
-            filtered = unfiltered
-
-        # Return the filtered event stream.
-        return filtered
+        date_generator = date_gen(
+            start=self.start,
+            end=self.end,
+            delta=self.delta,
+            trading_calendar=self.trading_calendar,
+        )
+        return (
+            create_trade(
+                sid=sid,
+                price=float(i % 10) + 1.0,
+                amount=(i * 50) % 900 + 100,
+                datetime=date,
+            ) for (i, date), sid in itertools.product(
+                enumerate(date_generator), self.sids
+            )
+        )

@@ -1,15 +1,11 @@
 import sys
 import logbook
 import numpy as np
-from datetime import datetime
-import pytz
 
-from zipline.algorithm import TradingAlgorithm
-from zipline.utils.factory import load_from_yahoo
-from zipline.finance import commission
+from zipline.finance import commission, slippage
 
 zipline_logging = logbook.NestedSetup([
-    logbook.NullHandler(level=logbook.DEBUG, bubble=True),
+    logbook.NullHandler(),
     logbook.StreamHandler(sys.stdout, level=logbook.INFO),
     logbook.StreamHandler(sys.stderr, level=logbook.ERROR),
 ])
@@ -24,6 +20,7 @@ STOCKS = ['AMD', 'CERN', 'COST', 'DELL', 'GPS', 'INTC', 'MMM']
 # http://icml.cc/2012/papers/168.pdf
 def initialize(algo, eps=1, window_length=5):
     algo.stocks = STOCKS
+    algo.sids = [algo.symbol(symbol) for symbol in algo.stocks]
     algo.m = len(algo.stocks)
     algo.price = {}
     algo.b_t = np.ones(algo.m) / algo.m
@@ -32,9 +29,9 @@ def initialize(algo, eps=1, window_length=5):
     algo.init = True
     algo.days = 0
     algo.window_length = window_length
-    algo.add_transform('mavg', 5)
 
-    algo.set_commission(commission.PerShare(cost=0))
+    algo.set_commission(commission.PerShare(cost=0, min_trade_cost=1.0))
+    algo.set_slippage(slippage.VolumeShareSlippage())
 
 
 def handle_data(algo, data):
@@ -50,13 +47,13 @@ def handle_data(algo, data):
     m = algo.m
 
     x_tilde = np.zeros(m)
-    b = np.zeros(m)
 
-    # find relative moving average price for each security
-    for i, stock in enumerate(algo.stocks):
-        price = data[stock].price
+    # find relative moving average price for each asset
+    mavgs = data.history(algo.sids, 'price', algo.window_length, '1d').mean()
+    for i, sid in enumerate(algo.sids):
+        price = data.current(sid, "price")
         # Relative mean deviation
-        x_tilde[i] = data[stock].mavg(algo.window_length) / price
+        x_tilde[i] = mavgs[sid] / price
 
     ###########################
     # Inside of OLMAR (algo 2)
@@ -98,21 +95,21 @@ def rebalance_portfolio(algo, data, desired_port):
         positions_value = algo.portfolio.positions_value + \
             algo.portfolio.cash
 
-    for i, stock in enumerate(algo.stocks):
-        current_amount[i] = algo.portfolio.positions[stock].amount
-        prices[i] = data[stock].price
+    for i, sid in enumerate(algo.sids):
+        current_amount[i] = algo.portfolio.positions[sid].amount
+        prices[i] = data.current(sid, "price")
 
     desired_amount = np.round(desired_port * positions_value / prices)
 
     algo.last_desired_port = desired_port
     diff_amount = desired_amount - current_amount
 
-    for i, stock in enumerate(algo.stocks):
-        algo.order(stock, diff_amount[i])
+    for i, sid in enumerate(algo.sids):
+        algo.order(sid, diff_amount[i])
 
 
 def simplex_projection(v, b=1):
-    """Projection vectors to the simplex domain
+    r"""Projection vectors to the simplex domain
 
     Implemented according to the paper: Efficient projections onto the
     l1-ball for learning in high dimensions, John Duchi, et al. ICML 2008.
@@ -125,7 +122,7 @@ def simplex_projection(v, b=1):
 
     :Example:
     >>> proj = simplex_projection([.4 ,.3, -.4, .5])
-    >>> print(proj)
+    >>> proj  # doctest: +NORMALIZE_WHITESPACE
     array([ 0.33333333, 0.23333333, 0. , 0.43333333])
     >>> print(proj.sum())
     1.0
@@ -148,13 +145,24 @@ def simplex_projection(v, b=1):
     w[w < 0] = 0
     return w
 
-if __name__ == '__main__':
-    import pylab as pl
-    start = datetime(2004, 1, 1, 0, 0, 0, 0, pytz.utc)
-    end = datetime(2008, 1, 1, 0, 0, 0, 0, pytz.utc)
-    data = load_from_yahoo(stocks=STOCKS, indexes={}, start=start, end=end)
-    data = data.dropna()
-    olmar = TradingAlgorithm(handle_data=handle_data, initialize=initialize)
-    results = olmar.run(data)
-    results.portfolio_value.plot()
-    pl.show()
+
+# Note: this function can be removed if running
+# this algorithm on quantopian.com
+def analyze(context=None, results=None):
+    import matplotlib.pyplot as plt
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    results.portfolio_value.plot(ax=ax)
+    ax.set_ylabel('Portfolio value (USD)')
+    plt.show()
+
+
+def _test_args():
+    """Extra arguments to use when zipline's automated tests run this example.
+    """
+    import pandas as pd
+
+    return {
+        'start': pd.Timestamp('2004', tz='utc'),
+        'end': pd.Timestamp('2008', tz='utc'),
+    }
